@@ -92,7 +92,7 @@ options:
     default: null
   state:
     description:
-      - Indicate desired state of the vm. 'reconfigured' only applies changes to 'vm_cdrom', 'memory_mb', and 'num_cpus' in vm_hardware parameter. The 'memory_mb' and 'num_cpus' changes are applied to powered-on vms when hot-plugging is enabled for the guest.
+      - Indicate desired state of the vm. 'reconfigured' only applies changes to 'vm_cdrom', 'vm_cdrom2', 'memory_mb', and 'num_cpus' in vm_hardware parameter. The 'memory_mb' and 'num_cpus' changes are applied to powered-on vms when hot-plugging is enabled for the guest.
     default: present
     choices: ['present', 'powered_off', 'absent', 'powered_on', 'restarted', 'reconfigured']
   from_template:
@@ -210,6 +210,9 @@ EXAMPLES = '''
       vm_cdrom:
         type: "iso"
         iso_path: "DatastoreName/cd-image.iso"
+      vm_cdrom2:
+        type: "iso"
+        iso_path: "DatastoreName/config-image.iso"
       vm_floppy:
         type: "image"
         image_path: "DatastoreName/floppy-image.flp"
@@ -370,7 +373,7 @@ def add_disk(module, s, config_target, config, devices, datastore, type="thin", 
     devices.append(disk_spec)
 
 
-def add_cdrom(module, s, config_target, config, devices, default_devs, type="client", vm_cd_iso_path=None):
+def add_cdrom(module, s, config_target, config, devices, default_devs, type="client", vm_cd_iso_path=None, unit_number=0):
     # Add a cd-rom
     # Make sure the datastore exists.
     if vm_cd_iso_path:
@@ -400,7 +403,7 @@ def add_cdrom(module, s, config_target, config, devices, default_devs, type="cli
             cd_ctrl.set_element_backing(iso)
             cd_ctrl.set_element_key(20)
             cd_ctrl.set_element_controllerKey(ide_ctlr.get_element_key())
-            cd_ctrl.set_element_unitNumber(0)
+            cd_ctrl.set_element_unitNumber(unit_number)
             cd_spec.set_element_device(cd_ctrl)
         elif type == "client":
             client = VI.ns0.VirtualCdromRemoteAtapiBackingInfo_Def(
@@ -409,7 +412,7 @@ def add_cdrom(module, s, config_target, config, devices, default_devs, type="cli
             cd_ctrl.set_element_backing(client)
             cd_ctrl.set_element_key(20)
             cd_ctrl.set_element_controllerKey(ide_ctlr.get_element_key())
-            cd_ctrl.set_element_unitNumber(0)
+            cd_ctrl.set_element_unitNumber(unit_number)
             cd_spec.set_element_device(cd_ctrl)
         else:
             s.disconnect()
@@ -925,12 +928,9 @@ def reconfigure_vm(vsphere_client, vm, module, esxi, resource_pool, cluster_name
         cdrom_type, cdrom_iso_path = get_cdrom_params(module, vsphere_client, vm_hardware['vm_cdrom'])
 
         cdrom = None
-        current_devices = vm.properties.config.hardware.device
-
-        for dev in current_devices:
-            if dev._type == 'VirtualCdrom':
-                cdrom = dev._obj
-                break
+        dev_list = [d for d in vm.properties.config.hardware.device if d._type=='VirtualCdrom']
+        if len(dev_list):
+            cdrom = dev_list[0]._obj
 
         if cdrom_type == 'iso':
             iso_location = cdrom_iso_path.split('/', 1)
@@ -960,6 +960,49 @@ def reconfigure_vm(vsphere_client, vm, module, esxi, resource_pool, cluster_name
         devices.append(dev_change)
 
         changes['cdrom'] = vm_hardware['vm_cdrom']
+
+    # Change 2nd CDROM - TODO: refactor vm_cdrom and vm_cdrom2 to one
+    if 'vm_cdrom2' in vm_hardware:
+        spec = spec_singleton(spec, request, vm)
+
+        cdrom_type, cdrom_iso_path = get_cdrom_params(module, vsphere_client, vm_hardware['vm_cdrom2'])
+
+        cdrom = None
+        dev_list = [d for d in vm.properties.config.hardware.device if d._type=='VirtualCdrom']
+        if len(dev_list) == 2:
+            vsphere_client.disconnect()
+            module.fail_json(msg="Error in vm_cdrom2 definition. Too many CD/DVDs defined in comparison to the VM's disk profile.")
+
+        cdrom = dev_list[1]._obj
+
+        if cdrom_type == 'iso':
+            iso_location = cdrom_iso_path.split('/', 1)
+            datastore, ds = find_datastore(
+                module, vsphere_client, iso_location[0], None)
+            iso_path = iso_location[1]
+            iso = VI.ns0.VirtualCdromIsoBackingInfo_Def('iso').pyclass()
+            iso.set_element_fileName('%s %s' % (datastore, iso_path))
+            cdrom.set_element_backing(iso)
+            cdrom.Connectable.set_element_connected(True)
+            cdrom.Connectable.set_element_startConnected(True)
+        elif cdrom_type == 'client':
+            client = VI.ns0.VirtualCdromRemoteAtapiBackingInfo_Def('client').pyclass()
+            client.set_element_deviceName("")
+            cdrom.set_element_backing(client)
+            cdrom.Connectable.set_element_connected(True)
+            cdrom.Connectable.set_element_startConnected(True)
+        else:
+            vsphere_client.disconnect()
+            module.fail_json(
+                msg="Error adding cdrom of type %s to vm spec. "
+                " cdrom type can either be iso or client" % (cdrom_type))
+
+        dev_change = spec.new_deviceChange()
+        dev_change.set_element_device(cdrom)
+        dev_change.set_element_operation('edit')
+        devices.append(dev_change)
+
+        changes['cdrom2'] = vm_hardware['vm_cdrom2']
 
     # Resize hard drives
     if vm_disk:
@@ -1361,9 +1404,14 @@ def create_vm(vsphere_client, module, esxi, resource_pool, cluster_name, guest, 
             disk_key = disk_key + 1
     if 'vm_cdrom' in vm_hardware:
         cdrom_type, cdrom_iso_path = get_cdrom_params(module, vsphere_client, vm_hardware['vm_cdrom'])
-        # Add a CD-ROM device to the VM.
+        # Add a 1st CD-ROM device to the VM.
         add_cdrom(module, vsphere_client, config_target, config, devices,
-                  default_devs, cdrom_type, cdrom_iso_path)
+                  default_devs, cdrom_type, cdrom_iso_path, 0)
+    if 'vm_cdrom2' in vm_hardware:
+        cdrom_type, cdrom_iso_path = get_cdrom_params(module, vsphere_client, vm_hardware['vm_cdrom2'])
+        # Add a 2nd CD-ROM device to the VM.
+        add_cdrom(module, vsphere_client, config_target, config, devices,
+                  default_devs, cdrom_type, cdrom_iso_path, 1)
     if 'vm_floppy' in vm_hardware:
         floppy_image_path = None
         floppy_type = None
